@@ -138,12 +138,14 @@ struct riscv_iommu_ir_target {
 };
 
 /*
- * FORWARD enables forwarding for one IRQ and provides the complete target array
- * so the first forwarded IRQ can initialize the domain MSI table. UPDATE_TARGET
- * replaces one target without changing per-IRQ forwarding state. The caller
- * must quiesce all MSI producers using the table when changing both words of a
- * live MRIF PTE because the update temporarily invalidates the entry. A NULL
- * vcpu_info disables forwarding for the IRQ.
+ * FORWARD enables forwarding for one IRQ and provides the target array so the
+ * first forwarded IRQ can initialize the domain MSI table. Entries of type
+ * RISCV_IOMMU_IR_TARGET_INVALID are skipped, so a caller may forward the whole
+ * virtual machine topology while only some of its interrupt files are hardware
+ * backed. UPDATE_TARGET replaces one target without changing per-IRQ forwarding
+ * state. The caller must quiesce all MSI producers using the table when
+ * changing both words of a live MRIF PTE because the update temporarily
+ * invalidates the entry. A NULL vcpu_info disables forwarding for the IRQ.
  *
  * A well-formed request which is incompatible with the producer or current
  * domain configuration returns -EOPNOTSUPP, allowing the caller to fall back
