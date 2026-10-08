@@ -60,6 +60,8 @@ struct kvm_kernel_irqfd {
 	struct irq_bypass_producer *producer;
 
 	struct kvm_vcpu *irq_bypass_vcpu;
+	/* Forwarded to any vCPU of the VM (guest-controlled MSI target) */
+	bool irq_bypass_nested;
 	struct list_head vcpu_list;
 	void *irq_bypass_data;
 };
