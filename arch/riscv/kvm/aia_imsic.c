@@ -758,7 +758,7 @@ int kvm_riscv_irqfd_unforward(struct kvm_kernel_irqfd *irqfd)
 
 	lockdep_assert_held(&kvm->irqfds.lock);
 
-	if (!irqfd->irq_bypass_vcpu)
+	if (!irqfd->irq_bypass_vcpu && !irqfd->irq_bypass_nested)
 		return 0;
 
 	irq_data = irq_get_irq_data(irqfd->producer->irq);
@@ -775,6 +775,7 @@ int kvm_riscv_irqfd_unforward(struct kvm_kernel_irqfd *irqfd)
 		return ret;
 
 	irqfd->irq_bypass_vcpu = NULL;
+	irqfd->irq_bypass_nested = false;
 	return 0;
 }
 
@@ -788,7 +789,11 @@ static int imsic_vcpu_unforward(struct kvm_vcpu *vcpu)
 	guard(spinlock_irqsave)(&kvm->irqfds.lock);
 
 	list_for_each_entry(irqfd, &kvm->irqfds.items, list) {
-		if (irqfd->irq_bypass_vcpu != vcpu)
+		/*
+		 * Nested-forwarded producers can target any vCPU of the VM,
+		 * unforward them on any VS-file release.
+		 */
+		if (!irqfd->irq_bypass_nested && irqfd->irq_bypass_vcpu != vcpu)
 			continue;
 
 		ret = kvm_riscv_irqfd_unforward(irqfd);
@@ -902,7 +907,7 @@ static int imsic_vsfile_target_replace(struct kvm_vcpu *vcpu, phys_addr_t vsfile
 	vcpu_info.target.type = RISCV_IOMMU_IR_TARGET_IMSIC;
 	vcpu_info.target.hpa = vsfile_pa;
 	list_for_each_entry(irqfd, &kvm->irqfds.items, list) {
-		if (!irqfd->irq_bypass_vcpu)
+		if (!irqfd->irq_bypass_vcpu && !irqfd->irq_bypass_nested)
 			continue;
 
 		ret = irq_set_vcpu_affinity(irqfd->producer->irq, &vcpu_info);
@@ -931,16 +936,10 @@ static bool imsic_targets_valid(struct kvm_aia *aia)
 	return true;
 }
 
-static struct kvm_vcpu *imsic_irqfd_route_vcpu(struct kvm *kvm,
-					       struct kvm_kernel_irq_routing_entry *irq_entry)
+static struct kvm_vcpu *imsic_irqfd_route_vcpu(struct kvm *kvm, gpa_t target)
 {
 	struct kvm_vcpu *vcpu;
 	unsigned long index;
-	gpa_t target;
-
-	target = ((gpa_t)irq_entry->msi.address_hi << 32) | irq_entry->msi.address_lo;
-	if (target & (IMSIC_MMIO_PAGE_SZ - 1))
-		return NULL;
 
 	kvm_for_each_vcpu(index, vcpu, kvm) {
 		if (target == vcpu->arch.aia_context.imsic_addr)
@@ -968,6 +967,9 @@ static int imsic_irqfd_forward(struct kvm_kernel_irqfd *irqfd,
 		.data = irq_entry->msi.data,
 	};
 	struct kvm_vcpu *vcpu;
+	gpa_t target, gpa;
+	unsigned int i;
+	bool nested = false;
 	int ret;
 
 	lockdep_assert_held(&kvm->irqfds.lock);
@@ -988,24 +990,51 @@ static int imsic_irqfd_forward(struct kvm_kernel_irqfd *irqfd,
 	 * The IOMMU writes MSIs straight into the VS-file, so bypass is
 	 * gated by the hardware backing checks below, not the AIA mode.
 	 */
-	if (!imsic_targets_valid(&kvm->arch.aia)) {
-		pr_debug("KVM: IMSIC IRQ bypass requires all VS-files\n");
+	target = ((gpa_t)irq_entry->msi.address_hi << 32) | irq_entry->msi.address_lo;
+	if (target & (IMSIC_MMIO_PAGE_SZ - 1))
 		return -EOPNOTSUPP;
+
+	vcpu = imsic_irqfd_route_vcpu(kvm, target);
+	if (vcpu) {
+		/*
+		 * The guest programmed a guest interrupt file address, so every
+		 * vCPU of the VM must be hardware backed for the complete
+		 * topology to be installable.
+		 */
+		if (!imsic_targets_valid(aia)) {
+			pr_debug("KVM: IMSIC IRQ bypass requires all VS-files\n");
+			return -EOPNOTSUPP;
+		}
+		gpa = vcpu->arch.aia_context.imsic_addr;
+	} else {
+		/*
+		 * A vIOMMU guest programs the device with an IOVA-space MSI
+		 * address, which names no vCPU until the IOMMU translates it
+		 * and resolves the target through its MSI table of published
+		 * VS-files. Forward such IRQs for the whole VM. The address
+		 * pattern comes from any published target, as only the
+		 * mask-covered index bits differ between them.
+		 */
+		for (i = 0; i < aia->nr_targets; i++)
+			if (aia->targets[i].type == RISCV_IOMMU_IR_TARGET_IMSIC)
+				break;
+		if (i == aia->nr_targets)
+			return -EOPNOTSUPP;
+		gpa = aia->targets[i].gpa;
+		nested = true;
 	}
 
-	/* Leave guest messages that name no vIMSIC to software injection. */
-	vcpu = imsic_irqfd_route_vcpu(kvm, irq_entry);
-	if (!vcpu)
-		return -EOPNOTSUPP;
-
-	vcpu_info.msi_addr_pattern = (vcpu->arch.aia_context.imsic_addr >> IMSIC_MMIO_PAGE_SHIFT) &
+	vcpu_info.msi_addr_pattern = (gpa >> IMSIC_MMIO_PAGE_SHIFT) &
 				     ~vcpu_info.msi_addr_mask;
 	ret = irq_set_vcpu_affinity(irqfd->producer->irq, &vcpu_info);
 	if (ret)
 		return ret;
 
 	pci_write_msi_msg(irqfd->producer->irq, &msg);
-	irqfd->irq_bypass_vcpu = vcpu;
+	if (nested)
+		irqfd->irq_bypass_nested = true;
+	else
+		irqfd->irq_bypass_vcpu = vcpu;
 
 	return 0;
 }
