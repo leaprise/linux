@@ -981,10 +981,13 @@ static int imsic_irqfd_forward(struct kvm_kernel_irqfd *irqfd,
 	 * MSI-X because pci_write_msi_msg() masks an MSI-X vector around the
 	 * update, which conventional MSI cannot provide.
 	 */
-	if (kvm->arch.aia.mode != KVM_DEV_RISCV_AIA_MODE_HWACCEL ||
-	    !imsic_irqfd_is_msix(irqfd))
+	if (!imsic_irqfd_is_msix(irqfd))
 		return -EOPNOTSUPP;
 
+	/*
+	 * The IOMMU writes MSIs straight into the VS-file, so bypass is
+	 * gated by the hardware backing checks below, not the AIA mode.
+	 */
 	if (!imsic_targets_valid(&kvm->arch.aia)) {
 		pr_debug("KVM: IMSIC IRQ bypass requires all VS-files\n");
 		return -EOPNOTSUPP;
