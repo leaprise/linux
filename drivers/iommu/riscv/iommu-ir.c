@@ -78,17 +78,27 @@ static int riscv_iommu_ir_validate_target(const struct riscv_iommu_ir_vcpu_info 
 static int riscv_iommu_ir_validate_targets(const struct riscv_iommu_ir_vcpu_info *vcpu_info,
 					   size_t nr_ptes, u64 *required_caps)
 {
+	unsigned int nr_valid = 0;
 	int ret;
 
-	if (!vcpu_info->targets || !vcpu_info->nr_targets || vcpu_info->nr_targets > nr_ptes)
+	if (!vcpu_info->targets || !vcpu_info->nr_targets)
 		return -EINVAL;
 
 	for (unsigned int i = 0; i < vcpu_info->nr_targets; i++) {
+		/* Interrupt files the host has not published yet are skipped. */
+		if (vcpu_info->targets[i].type == RISCV_IOMMU_IR_TARGET_INVALID)
+			continue;
+
 		ret = riscv_iommu_ir_validate_target(vcpu_info, &vcpu_info->targets[i],
 						     required_caps);
 		if (ret)
 			return ret;
+		nr_valid++;
 	}
+
+	/* The table only has to be able to deliver some interrupt file. */
+	if (!nr_valid || nr_valid > nr_ptes)
+		return -EINVAL;
 
 	return 0;
 }
@@ -147,9 +157,16 @@ static int riscv_iommu_ir_activate(struct riscv_iommu_msi_table *msi_table,
 
 	for (unsigned int i = 0; i < vcpu_info->nr_targets; i++) {
 		const struct riscv_iommu_ir_target *target = &vcpu_info->targets[i];
-		size_t idx = riscv_iommu_ir_extract(target->gpa >> IMSIC_MMIO_PAGE_SHIFT,
-						    vcpu_info->msi_addr_mask);
-		struct riscv_iommu_msipte *msipte = &msi_table->root[idx];
+		size_t idx;
+		struct riscv_iommu_msipte *msipte;
+
+		/* Interrupt files the host has not published yet are skipped. */
+		if (target->type == RISCV_IOMMU_IR_TARGET_INVALID)
+			continue;
+
+		idx = riscv_iommu_ir_extract(target->gpa >> IMSIC_MMIO_PAGE_SHIFT,
+					     vcpu_info->msi_addr_mask);
+		msipte = &msi_table->root[idx];
 
 		/* A populated entry in the initially clear table indicates duplicate targets. */
 		if (msipte->pte || msipte->mrif_info) {
