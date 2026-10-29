@@ -880,6 +880,13 @@ PT_IOMMU_CHECK_DOMAIN(struct riscv_iommu_domain, riscvpt.iommu, domain);
 #define iommu_domain_to_riscv(iommu_domain) \
 	container_of(iommu_domain, struct riscv_iommu_domain, domain)
 
+/*
+ * Resolve the domain holding the device bond: when the previously attached
+ * domain is a nested domain, the device is bonded to its stage-2 parent,
+ * which also owns the MSI table.
+ */
+static struct iommu_domain *riscv_iommu_old_bond_domain(struct iommu_domain *old);
+
 struct riscv_iommu_msi_table *riscv_iommu_msi_table_rcu(struct riscv_iommu_info *info)
 {
 	struct riscv_iommu_domain *domain;
@@ -1602,6 +1609,8 @@ static int riscv_iommu_attach_paging_domain(struct iommu_domain *iommu_domain,
 	unsigned long flags;
 	int ret;
 
+	old = riscv_iommu_old_bond_domain(old);
+
 	pt_iommu_riscv_64_hw_info(&domain->riscvpt, &pt_info);
 
 	if (domain->gscid) {
@@ -1796,6 +1805,8 @@ static int riscv_iommu_attach_blocking_domain(struct iommu_domain *iommu_domain,
 	struct riscv_iommu_dc dc = {0};
 	unsigned long flags;
 
+	old = riscv_iommu_old_bond_domain(old);
+
 	dc.fsc = RISCV_IOMMU_DC_FSC_MODE_BARE;
 	dc.tc = 0;
 
@@ -1824,6 +1835,8 @@ static int riscv_iommu_attach_identity_domain(struct iommu_domain *iommu_domain,
 	struct riscv_iommu_info *info = dev_iommu_priv_get(dev);
 	struct riscv_iommu_dc dc = {0};
 	unsigned long flags;
+
+	old = riscv_iommu_old_bond_domain(old);
 
 	dc.fsc = RISCV_IOMMU_DC_FSC_MODE_BARE;
 	dc.tc = RISCV_IOMMU_DC_TC_V;
@@ -1947,8 +1960,15 @@ struct riscv_iommu_nested_domain {
 	u64 iosatp;
 };
 
-#define to_riscv_iommu_nested_domain(domain) \
-	container_of(domain, struct riscv_iommu_nested_domain, domain)
+#define to_riscv_iommu_nested_domain(domain_ptr) \
+	container_of(domain_ptr, struct riscv_iommu_nested_domain, domain)
+
+static struct iommu_domain *riscv_iommu_old_bond_domain(struct iommu_domain *old)
+{
+	if (old && old->type == IOMMU_DOMAIN_NESTED)
+		return &to_riscv_iommu_nested_domain(old)->viommu->s2_parent->domain;
+	return old;
+}
 
 static int riscv_iommu_attach_dev_nested(struct iommu_domain *domain,
 					 struct device *dev,
@@ -1960,7 +1980,11 @@ static int riscv_iommu_attach_dev_nested(struct iommu_domain *domain,
 	struct riscv_iommu_domain *s2_parent = nested_domain->viommu->s2_parent;
 	struct riscv_iommu_info *info = dev_iommu_priv_get(dev);
 	struct pt_iommu_riscv_64_hw_info pt_info;
+	struct iommu_domain *old = riscv_iommu_old_bond_domain(old_domain);
+	struct riscv_iommu_bond *bond;
 	struct riscv_iommu_dc dc = {0};
+	unsigned long flags;
+	int ret;
 
 	if (nested_domain->viommu->iommu != iommu)
 		return -EINVAL;
@@ -1980,12 +2004,32 @@ static int riscv_iommu_attach_dev_nested(struct iommu_domain *domain,
 	/* SVA/PASID are not supported now, keep PSCID at 0. */
 	dc.ta = FIELD_PREP(RISCV_IOMMU_DC_TA_PSCID, 0);
 
-	if (riscv_iommu_bond_link(s2_parent, dev))
-		return -ENOMEM;
+	ret = riscv_iommu_msi_table_alloc(s2_parent, iommu, info);
+	if (ret)
+		return ret;
 
-	riscv_iommu_iodir_update(iommu, dev, &dc);
-	riscv_iommu_bond_unlink(info->domain, dev);
-	info->domain = s2_parent;
+	bond = kzalloc_obj(*bond);
+	if (!bond)
+		return -ENOMEM;
+	bond->dev = dev;
+
+	flags = riscv_iommu_msi_tables_lock(old, &s2_parent->domain);
+	if (!riscv_iommu_can_attach_paging_domain(&s2_parent->domain, dev, old)) {
+		riscv_iommu_msi_tables_unlock(old, &s2_parent->domain, flags);
+		kfree(bond);
+		return -EBUSY;
+	}
+
+	/* Keep an active guest MSI table published across the DC update. */
+	if (s2_parent->msi_table.nr_forwarded_irqs)
+		riscv_iommu_msi_table_set_dc(&s2_parent->msi_table, &dc, true);
+
+	info->dc = dc;
+	riscv_iommu_bond_link(s2_parent, bond);
+	riscv_iommu_iodir_update(dev, &info->dc);
+	riscv_iommu_bond_unlink(old, dev);
+	rcu_assign_pointer(info->domain, s2_parent);
+	riscv_iommu_msi_tables_unlock(old, &s2_parent->domain, flags);
 
 	return 0;
 }
