@@ -964,24 +964,31 @@ struct riscv_iommu_bond {
 	struct list_head list;
 	struct rcu_head rcu;
 	struct device *dev;
+	int gscid;
 };
 
 static void riscv_iommu_bond_link(struct riscv_iommu_domain *domain,
 				  struct riscv_iommu_bond *bond)
 {
 	struct riscv_iommu_device *iommu = dev_to_iommu(bond->dev);
-	struct list_head *bonds;
+	struct riscv_iommu_bond *pos;
+	struct list_head *bonds = &domain->bonds;
 	unsigned long flags;
 
 	/*
 	 * List of devices attached to the domain is arranged based on
-	 * managed IOMMU device.
+	 * managed IOMMU device and GSCID.
 	 */
 
 	raw_spin_lock_irqsave(&domain->lock, flags);
-	list_for_each(bonds, &domain->bonds)
-		if (dev_to_iommu(list_entry(bonds, struct riscv_iommu_bond, list)->dev) == iommu)
+	list_for_each_entry(pos, &domain->bonds, list) {
+		if (dev_to_iommu(pos->dev) != iommu)
+			continue;
+
+		bonds = &pos->list;
+		if (pos->gscid == bond->gscid)
 			break;
+	}
 	list_add_rcu(&bond->list, bonds);
 	raw_spin_unlock_irqrestore(&domain->lock, flags);
 
@@ -1149,12 +1156,13 @@ static void riscv_iommu_iotlb_inval(struct riscv_iommu_domain *domain,
 	struct riscv_iommu_device *iommu, *prev;
 	struct riscv_iommu_bond *bond;
 	struct riscv_iommu_tlbi tlbi;
+	int prev_gscid = -1;
 
 	riscv_iommu_tlbi_calc(&tlbi, gather);
 
 	/*
-	 * For each IOMMU linked with this protection domain (via bonds->dev),
-	 * an IOTLB invaliation command will be submitted and executed.
+	 * For each IOMMU and GSCID linked with this protection domain through
+	 * its bonds, an IOTLB invalidation command will be submitted and executed.
 	 *
 	 * Possbile race with domain attach flow is handled by sequencing
 	 * bond creation - riscv_iommu_bond_link(), and device directory
@@ -1164,9 +1172,9 @@ static void riscv_iommu_iotlb_inval(struct riscv_iommu_domain *domain,
 	 * --------------------------         --------------------------
 	 * update page table entries          add dev to the bond list
 	 * FENCE RW,RW                        FENCE RW,RW
-	 * For all IOMMUs: (can be empty)     Update FSC/PSCID
-	 *   FENCE IOW,IOW                      FENCE IOW,IOW
-	 *   IOTLB.INVAL                        IODIR.INVAL
+	 * For all IOMMU/GSCID pairs:         Update FSC/PSCID
+	 *   FENCE IOW,IOW                    FENCE IOW,IOW
+	 *   IOTLB.INVAL                      IODIR.INVAL
 	 *   IOFENCE.C
 	 *
 	 * If bond list is not updated with new device, directory context will
@@ -1184,15 +1192,16 @@ static void riscv_iommu_iotlb_inval(struct riscv_iommu_domain *domain,
 
 		/*
 		 * IOTLB invalidation request can be safely omitted if already sent
-		 * to the IOMMU for the same PSCID, and with domain->bonds list
-		 * arranged based on the device's IOMMU, it's sufficient to check
-		 * last device the invalidation was sent to.
+		 * to the IOMMU for the same GSCID. Since bonds are arranged by
+		 * IOMMU and GSCID, it is sufficient to check the previous bond.
 		 */
-		if (iommu == prev)
+		if (iommu == prev && bond->gscid == prev_gscid)
 			continue;
 
-		riscv_iommu_iotlb_inval_iommu(iommu, domain->pscid, domain->gscid, &tlbi);
+		riscv_iommu_iotlb_inval_iommu(iommu, domain->pscid, bond->gscid,
+					      &tlbi);
 		prev = iommu;
+		prev_gscid = bond->gscid;
 	}
 
 	prev = NULL;
@@ -1636,6 +1645,7 @@ static int riscv_iommu_attach_paging_domain(struct iommu_domain *iommu_domain,
 	if (!bond)
 		return -ENOMEM;
 	bond->dev = dev;
+	bond->gscid = domain->gscid;
 
 	flags = riscv_iommu_msi_tables_lock(old, iommu_domain);
 	if (!riscv_iommu_can_attach_paging_domain(iommu_domain, dev, old)) {
@@ -1986,12 +1996,57 @@ struct riscv_iommu_nested_domain {
 #define to_riscv_iommu_nested_domain(domain) \
 	container_of(domain, struct riscv_iommu_nested_domain, domain)
 
+static int riscv_iommu_attach_dev_nested(struct iommu_domain *domain,
+					 struct device *dev,
+					 struct iommu_domain *old_domain)
+{
+	struct riscv_iommu_nested_domain *nested_domain =
+		to_riscv_iommu_nested_domain(domain);
+	struct riscv_iommu_device *iommu = dev_to_iommu(dev);
+	struct riscv_iommu_domain *s2_parent = nested_domain->viommu->s2_parent;
+	struct riscv_iommu_info *info = dev_iommu_priv_get(dev);
+	struct pt_iommu_riscv_64_hw_info pt_info;
+	struct riscv_iommu_bond *bond;
+	struct riscv_iommu_dc dc = {0};
+
+	if (nested_domain->viommu->iommu != iommu)
+		return -EINVAL;
+
+	if (!s2_parent->nest_parent)
+		return -EINVAL;
+
+	pt_iommu_riscv_64_hw_info(&s2_parent->riscvpt, &pt_info);
+
+	dc.tc = nested_domain->tc;
+	dc.fsc = nested_domain->iosatp;
+
+	dc.iohgatp = FIELD_PREP(RISCV_IOMMU_DC_IOHGATP_MODE, pt_info.iohgatp_mode) |
+		     FIELD_PREP(RISCV_IOMMU_DC_IOHGATP_PPN, pt_info.ppn) |
+		     FIELD_PREP(RISCV_IOMMU_DC_IOHGATP_GSCID,
+				nested_domain->viommu->gscid);
+	dc.ta = nested_domain->ta;
+
+	bond = kzalloc_obj(*bond);
+	if (!bond)
+		return -ENOMEM;
+	bond->dev = dev;
+	bond->gscid = nested_domain->viommu->gscid;
+
+	riscv_iommu_bond_link(s2_parent, bond);
+	riscv_iommu_iodir_update(dev, &dc);
+	riscv_iommu_bond_unlink(old_domain, dev);
+	info->domain = s2_parent;
+
+	return 0;
+}
+
 static void riscv_iommu_domain_nested_free(struct iommu_domain *domain)
 {
 	kfree(to_riscv_iommu_nested_domain(domain));
 }
 
 static const struct iommu_domain_ops riscv_iommu_nested_ops = {
+	.attach_dev = riscv_iommu_attach_dev_nested,
 	.free = riscv_iommu_domain_nested_free,
 };
 
